@@ -227,8 +227,6 @@ def do_sync(config, state, stream):
     singer.write_schema(tap_stream_id, stream.schema.to_dict(),
                         stream.key_properties)
 
-    LOGGER.info(metadata)
-
     keys = {"table": metadata["table-name"],
             "columns": "*",
             "datetime_key": metadata.get("replication-key"),
@@ -294,7 +292,7 @@ def do_sync(config, state, stream):
 
             # NOTE: Needed to handle nested objects/lists with datetime
             record = deep_convert_datetimes(record)
-            singer.write_record(stream.stream, record)
+            singer.write_record(tap_stream_id, record)
 
             last_update = record[keys["datetime_key"]]
             counter.increment()
