@@ -11,11 +11,11 @@ from singer import utils as singer_utils
 from singer import metadata
 from singer.catalog import Catalog
 
-from . import sync_bigquery as source
-from . import utils
+from tap_bigquery import sync_bigquery as source
+from tap_bigquery import utils
 
 
-REQUIRED_CONFIG_KEYS = ["streams", "start_datetime"]
+REQUIRED_CONFIG_KEYS = ["start_date"]
 
 
 LOGGER = utils.get_logger(__name__)
@@ -39,24 +39,7 @@ def load_schemas():
 
 
 def discover(config):
-    streams = []
-
-    for stream in config["streams"]:
-        stream_metadata, stream_key_properties, schema = source.do_discover(
-            config,
-            stream)
-
-        # create and add catalog entry
-        catalog_entry = {
-            'stream': stream["name"],
-            'tap_stream_id': stream["name"],
-            'schema': schema,
-            'metadata' : stream_metadata,
-            'key_properties': stream_key_properties
-        }
-        streams.append(catalog_entry)
-
-    return {'streams': streams}
+    return source.do_discover(config)
 
 
 def _get_selected_streams(catalog):
@@ -128,7 +111,7 @@ def parse_args():
 
     # Capture additional args
     parser.add_argument(
-        "--start_datetime", type=str,
+        "--start_date", type=str,
         help="Inclusive start date time in ISO8601-Date-String format: 2019-04-11T00:00:00Z")
     parser.add_argument(
         "--end_datetime", type=str,
@@ -166,14 +149,14 @@ def main():
 
     singer_utils.check_config(CONFIG, REQUIRED_CONFIG_KEYS)
 
-    if not CONFIG.get("start_datetime") and not CONFIG.get("state"):
-        LOGGER.error("state or start_datetime must be specified")
+    if not CONFIG.get("start_date") and not CONFIG.get("state"):
+        LOGGER.error("state or start_date must be specified")
         return
 
     # If discover flag was passed, run discovery mode and dump output to stdout
     if args.discover:
         catalog = discover(CONFIG)
-        print(json.dumps(catalog, indent=2))
+        catalog.dump()
     # Otherwise run in sync mode
     elif args.catalog:
         catalog = args.catalog

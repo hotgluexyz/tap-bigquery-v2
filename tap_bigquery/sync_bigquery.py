@@ -9,8 +9,9 @@ import singer.metrics as metrics
 from google.cloud import bigquery
 
 from . import utils
-import getschema
 
+from singer.catalog import Catalog, CatalogEntry
+from singer.schema import Schema
 
 
 LOGGER = utils.get_logger(__name__)
@@ -53,20 +54,20 @@ def _build_query(keys, filters=[], inclusive_start=True, limit=None):
         for f in filters:
             query = query + " AND " + f
 
-    if keys.get("datetime_key") and keys.get("start_datetime"):
+    if keys.get("datetime_key") and keys.get("start_date"):
         if inclusive_start:
             query = (query +
-                     (" AND datetime '{start_datetime}' <= " +
-                      "CAST({datetime_key} as datetime)").format(**keys))
+                     (" AND '{start_date}' <= " +
+                      "{datetime_key}").format(**keys))
         else:
             query = (query +
-                     (" AND datetime '{start_datetime}' < " +
-                      "CAST({datetime_key} as datetime)").format(**keys))
+                     (" AND '{start_date}' < " +
+                      "{datetime_key}").format(**keys))
 
     if keys.get("datetime_key") and keys.get("end_datetime"):
         query = (query +
-                 (" AND CAST({datetime_key} as datetime) < " +
-                  "datetime '{end_datetime}'").format(**keys))
+                 (" AND {datetime_key} < " +
+                  "'{end_datetime}'").format(**keys))
     if keys.get("datetime_key"):
         query = (query + " ORDER BY {datetime_key}".format(**keys))
 
@@ -75,84 +76,129 @@ def _build_query(keys, filters=[], inclusive_start=True, limit=None):
 
     return query
 
+TYPE_MAP = {
+    'STRING': { 'type': 'string'},
+    'BOOLEAN':  { 'type': 'boolean' },
+    'BOOL':  { 'type': 'boolean' },
+    'INTEGER': { 'type': 'integer' },
+    'INT64': { 'type': 'integer' },
+    'FLOAT': { 'type': 'number', 'format': 'float' },
+    'FLOAT64': { 'type': 'number', 'format': 'float' },
+    'NUMERIC': { 'type': 'number', 'format': 'float' },
+    'TIMESTAMP': { 'type': 'string', 'format': 'date-time' },
+    'DATETIME': { 'type': 'string', 'format': 'date-time' },
+    'DATE': { 'type': 'string', 'format': 'date' },
+    'TIME': { 'type': 'string', 'format': 'time' },
+    # TODO: 'BYTES' - I'm not sure how this comes, maybe a list of ints?
+}
 
-def do_discover(config, stream, output_schema_file=None,
+def convert_schemafield_to_jsonschema(schemafields):
+    jsonschema = { 'type': 'object', 'properties': {} }
+
+    for schemafield in schemafields:
+        if schemafield.field_type in TYPE_MAP:
+            jsonschema['properties'][schemafield.name] = TYPE_MAP[schemafield.field_type].copy()
+        elif schemafield.field_type == 'RECORD' or schemafield.field_type == 'STRUCT':
+            jsonschema['properties'][schemafield.name] = convert_schemafield_to_jsonschema(schemafield.fields)
+        else:
+            raise NotImplementedError(f"Field type not supported: {schemafield.field_type}")
+
+        if schemafield.mode == 'NULLABLE':
+            type = jsonschema['properties'][schemafield.name]['type']
+            jsonschema['properties'][schemafield.name]['type'] = ['null', type]
+        elif schemafield.mode == 'REPEATED':
+            jsonschema['properties'][schemafield.name] = {
+                'type': 'array',
+                'items': jsonschema['properties'][schemafield.name]
+            }
+        jsonschema['properties'][schemafield.name]['description'] = schemafield.description
+    return jsonschema
+
+def do_discover(config, output_schema_file=None,
                 add_timestamp=True):
     client = get_bigquery_client()
+    project = config["project"]
+    streams = []
 
-    start_datetime = dateutil.parser.parse(
-        config.get("start_datetime")).strftime("%Y-%m-%d %H:%M:%S.%f")
+    for dataset in client.list_datasets(project):
+        for t in client.list_tables(dataset.dataset_id):
+            full_table_id = f"{project}.{dataset.dataset_id}.{t.table_id}"
 
-    end_datetime = None
-    if config.get("end_datetime"):
-        end_datetime = dateutil.parser.parse(
-            config.get("end_datetime")).strftime("%Y-%m-%d %H:%M:%S.%f")
+            # Load the full table details to get the schema
+            table = client.get_table(full_table_id)
+            replication_key = None
 
-    keys = {"table": stream["table"],
-            "columns": stream["columns"],
-            "datetime_key": stream["datetime_key"],
-            "start_datetime": start_datetime,
-            "end_datetime": end_datetime
+            try:
+                schema = Schema.from_dict(convert_schemafield_to_jsonschema(table.schema))
+            except:
+                LOGGER.exception(f"Skipping table {t.full_table_id}: Error:")
+                continue
+
+            # Try and guess required properties by looking for required fields that end in "id"
+            # if this doesn't work, users can always specify their own key-properties with catalog
+            key_properties = [s.name for s in table.schema if s.mode == 'REQUIRED' and s.name.lower().endswith("id")]
+            metadata = {
+                'inclusion': 'available',
+                'selected': True,
+                'table-name': full_table_id,
+                'table-created-at': utils.strftime(table.created),
+                'table-labels': table.labels,
             }
-    limit = config.get("limit", 100)
-    query = _build_query(keys, stream.get("filters"), limit=limit)
 
-    LOGGER.info("Running query:\n    " + query)
+            if replication_key is not None:
+                metadata['replication-key'] = replication_key
 
-    query_job = client.query(query)
-    results = query_job.result()  # Waits for job to complete.
+            stream_metadata = [{
+                'metadata': metadata,
+                'breadcrumb': []
+            }]
 
-    data = []
-    # Read everything upfront
-    for row in results:
-        record = {}
-        for key in row.keys():
-            record[key] = row[key]
-        data.append(record)
+            stream_name = full_table_id.replace(".", "__").replace('-', '_')
+            if replication_key is not None:
+                streams.append(
+                    CatalogEntry(
+                        tap_stream_id=stream_name,
+                        stream=f"{dataset.dataset_id}_{table.table_id}",
+                        schema=schema,
+                        key_properties=key_properties,
+                        metadata=stream_metadata,
+                        replication_key=replication_key,
+                        is_view=None,
+                        database=None,
+                        table=None,
+                        row_count=None,
+                        stream_alias=None,
+                        replication_method='INCREMENTAL',
+                    )
+                )
+            else:
+                streams.append(
+                    CatalogEntry(
+                        tap_stream_id=stream_name,
+                        stream=f"{dataset.dataset_id}_{table.table_id}",
+                        schema=schema,
+                        key_properties=key_properties,
+                        metadata=stream_metadata,
+                        is_view=None,
+                        database=None,
+                        table=None,
+                        row_count=None,
+                        stream_alias=None,
+                        replication_method='FULL_TABLE',
+                    )
+                )
 
-    if not data:
-        raise Exception("Cannot infer schema: No record returned.")
+    return Catalog(streams)
 
-    schema = getschema.infer_schema(data)
-    if add_timestamp:
-        timestamp_format = {"type": ["null", "string"],
-                            "format": "date-time"}
-        schema["properties"][EXTRACT_TIMESTAMP] = timestamp_format
-        schema["properties"][BATCH_TIMESTAMP] = timestamp_format
-        # Support the legacy field
-        schema["properties"][LEGACY_TIMESTAMP] = {"type": ["null", "number"],
-                                                  "inclusion": "automatic"}
 
-    if output_schema_file:
-        with open(output_schema_file, "w") as f:
-            json.dump(schema, f, indent=2)
-
-    stream_metadata = [{
-        "metadata": {
-            "selected": True,
-            "table": stream["table"],
-            "columns": stream["columns"],
-            "filters": stream.get("filters", []),
-            "datetime_key": stream["datetime_key"]
-            # "inclusion": "available",
-            # "table-key-properties": ["id"],
-            # "valid-replication-keys": ["date_modified"],
-            # "schema-name": "users"
-            },
-        "breadcrumb": []
-        }]
-
-    # TODO: Need to put something in here?
-    key_properties = []
-
-    catalog = {"selected": True,
-               "type": "object",
-               "stream": stream["name"],
-               "key_properties": key_properties,
-               "properties": schema["properties"]
-               }
-
-    return stream_metadata, key_properties, catalog
+def deep_convert_datetimes(value):
+    if isinstance(value, list):
+        return [deep_convert_datetimes(child) for child in value]
+    elif isinstance(value, dict):
+        return {k: deep_convert_datetimes(v) for k, v in value.items()}
+    elif isinstance(value, datetime.date) or isinstance(value, datetime.datetime):
+        return value.isoformat()
+    return value
 
 
 def do_sync(config, state, stream):
@@ -164,14 +210,14 @@ def do_sync(config, state, stream):
     tap_stream_id = stream.tap_stream_id
 
     inclusive_start = True
-    start_datetime = singer.get_bookmark(state, tap_stream_id,
+    start_date = singer.get_bookmark(state, tap_stream_id,
                                          BOOKMARK_KEY_NAME)
-    if start_datetime:
+    if start_date:
         if not config.get("start_always_inclusive"):
             inclusive_start = False
     else:
-        start_datetime = config.get("start_datetime")
-    start_datetime = dateutil.parser.parse(start_datetime).strftime(
+        start_date = config.get("start_date")
+    start_date = dateutil.parser.parse(start_date).strftime(
             "%Y-%m-%d %H:%M:%S.%f")
 
     if config.get("end_datetime"):
@@ -181,10 +227,12 @@ def do_sync(config, state, stream):
     singer.write_schema(tap_stream_id, stream.schema.to_dict(),
                         stream.key_properties)
 
-    keys = {"table": metadata["table"],
-            "columns": metadata["columns"],
-            "datetime_key": metadata.get("datetime_key"),
-            "start_datetime": start_datetime,
+    LOGGER.info(metadata)
+
+    keys = {"table": metadata["table-name"],
+            "columns": "*",
+            "datetime_key": metadata.get("replication-key"),
+            "start_date": start_date,
             "end_datetime": end_datetime
             }
 
@@ -194,7 +242,7 @@ def do_sync(config, state, stream):
     query_job = client.query(query)
 
     properties = stream.schema.properties
-    last_update = start_datetime
+    last_update = start_date
 
     LOGGER.info("Running query:\n    %s" % query)
 
@@ -244,6 +292,8 @@ def do_sync(config, state, stream):
             if EXTRACT_TIMESTAMP in properties.keys():
                 record[EXTRACT_TIMESTAMP] = extract_tstamp.isoformat()
 
+            # NOTE: Needed to handle nested objects/lists with datetime
+            record = deep_convert_datetimes(record)
             singer.write_record(stream.stream, record)
 
             last_update = record[keys["datetime_key"]]
